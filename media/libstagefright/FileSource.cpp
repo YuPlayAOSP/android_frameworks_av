@@ -30,6 +30,7 @@ namespace android {
 
 FileSource::FileSource(const char *filename)
     : mFd(-1),
+      mUri(filename),
       mOffset(0),
       mLength(-1),
       mDecryptHandle(NULL),
@@ -58,6 +59,7 @@ FileSource::FileSource(int fd, int64_t offset, int64_t length)
       mDrmBuf(NULL){
     CHECK(offset >= 0);
     CHECK(length >= 0);
+    fetchUriFromFd(fd);
 }
 
 FileSource::~FileSource() {
@@ -166,7 +168,7 @@ ssize_t FileSource::readAtDRM(off64_t offset, void *data, size_t size) {
     }
 
     if (mDrmBuf != NULL && mDrmBufSize > 0 && (offset + mOffset) >= mDrmBufOffset
-            && (offset + mOffset + size) <= (mDrmBufOffset + mDrmBufSize)) {
+            && (offset + mOffset + size) <= static_cast<size_t>(mDrmBufOffset + mDrmBufSize)) {
         /* Use buffered data */
         memcpy(data, (void*)(mDrmBuf+(offset+mOffset-mDrmBufOffset)), size);
         return size;
@@ -177,7 +179,7 @@ ssize_t FileSource::readAtDRM(off64_t offset, void *data, size_t size) {
                 DRM_CACHE_SIZE, offset + mOffset);
         if (mDrmBufSize > 0) {
             int64_t dataRead = 0;
-            dataRead = size > mDrmBufSize ? mDrmBufSize : size;
+            dataRead = size > static_cast<size_t>(mDrmBufSize) ? mDrmBufSize : size;
             memcpy(data, (void*)mDrmBuf, dataRead);
             return dataRead;
         } else {
@@ -186,6 +188,20 @@ ssize_t FileSource::readAtDRM(off64_t offset, void *data, size_t size) {
     } else {
         /* Too big chunk to cache. Call DRM directly */
         return mDrmManagerClient->pread(mDecryptHandle, data, size, offset + mOffset);
+    }
+}
+
+void FileSource::fetchUriFromFd(int fd) {
+    ssize_t len = 0;
+    char path[PATH_MAX] = {0};
+    char link[PATH_MAX] = {0};
+
+    mUri.clear();
+
+    snprintf(path, PATH_MAX, "/proc/%d/fd/%d", getpid(), fd);
+    if ((len = readlink(path, link, sizeof(link)-1)) != -1) {
+        link[len] = '\0';
+        mUri.setTo(link);
     }
 }
 }  // namespace android

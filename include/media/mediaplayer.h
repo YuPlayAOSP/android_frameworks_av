@@ -53,7 +53,7 @@ enum media_event_type {
     MEDIA_ERROR             = 100,
     MEDIA_INFO              = 200,
     MEDIA_SUBTITLE_DATA     = 201,
-    MEDIA_META_DATA         = 202,
+    MEDIA_META_DATA         = 202
 };
 
 // Generic error codes for the media player framework.  Errors are fatal, the
@@ -147,7 +147,8 @@ enum media_player_states {
     MEDIA_PLAYER_STARTED            = 1 << 4,
     MEDIA_PLAYER_PAUSED             = 1 << 5,
     MEDIA_PLAYER_STOPPED            = 1 << 6,
-    MEDIA_PLAYER_PLAYBACK_COMPLETE  = 1 << 7
+    MEDIA_PLAYER_PLAYBACK_COMPLETE  = 1 << 7,
+    MEDIA_PLAYER_SUSPENDED          = 1 << 8
 };
 
 // Keep KEY_PARAMETER_* in sync with MediaPlayer.java.
@@ -209,7 +210,7 @@ public:
             void            died();
             void            disconnect();
 
-            status_t        setDataSource(
+    virtual status_t        setDataSource(
                     const sp<IMediaHTTPService> &httpService,
                     const char *url,
                     const KeyedVector<String8, String8> *headers);
@@ -224,7 +225,7 @@ public:
             status_t        prepareAsync();
             status_t        start();
             status_t        stop();
-            status_t        pause();
+    virtual status_t        pause();
             bool            isPlaying();
             status_t        setPlaybackSettings(const AudioPlaybackRate& rate);
             status_t        getPlaybackSettings(AudioPlaybackRate* rate /* nonnull */);
@@ -234,7 +235,7 @@ public:
                                     float* videoFps /* nonnull */);
             status_t        getVideoWidth(int *w);
             status_t        getVideoHeight(int *h);
-            status_t        seekTo(int msec);
+    virtual status_t        seekTo(int msec);
             status_t        getCurrentPosition(int *msec);
             status_t        getDuration(int *msec);
             status_t        reset();
@@ -243,7 +244,7 @@ public:
             status_t        setLooping(int loop);
             bool            isLooping();
             status_t        setVolume(float leftVolume, float rightVolume);
-            void            notify(int msg, int ext1, int ext2, const Parcel *obj = NULL);
+    virtual void            notify(int msg, int ext1, int ext2, const Parcel *obj = NULL);
             status_t        invoke(const Parcel& request, Parcel *reply);
             status_t        setMetadataFilter(const Parcel& filter);
             status_t        getMetadata(bool update_only, bool apply_filter, Parcel *metadata);
@@ -255,6 +256,8 @@ public:
             status_t        getParameter(int key, Parcel* reply);
             status_t        setRetransmitEndpoint(const char* addrString, uint16_t port);
             status_t        setNextMediaPlayer(const sp<MediaPlayer>& player);
+            status_t        suspend();
+            status_t        resume();
 
 private:
             void            clear_l();
@@ -289,6 +292,7 @@ private:
     float                       mSendLevel;
     struct sockaddr_in          mRetransmitEndpoint;
     bool                        mRetransmitEndpointValid;
+    friend class QCMediaPlayer;
 };
 
 }; // namespace android

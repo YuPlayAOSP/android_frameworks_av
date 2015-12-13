@@ -43,13 +43,14 @@ protected:
 
 private:
     enum {
-        kNumBuffers = 4
+        kNumBuffers = 8
     };
 
     bool mSignalledError;
 
     int32_t mChannelCount;
     int32_t mSampleRate;
+    int32_t mBitsPerSample;
 
     void initPorts();
     status_t initDecoder();

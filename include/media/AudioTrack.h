@@ -31,6 +31,7 @@ namespace android {
 struct audio_track_cblk_t;
 class AudioTrackClientProxy;
 class StaticAudioTrackClientProxy;
+struct ExtendedMediaUtils;
 
 // ----------------------------------------------------------------------------
 
@@ -623,6 +624,7 @@ private:
      */
             status_t    obtainBuffer(Buffer* audioBuffer, const struct timespec *requested,
                                      struct timespec *elapsed = NULL, size_t *nonContig = NULL);
+     friend struct ExtendedMediaUtils;
 public:
 
     /* Public API for TRANSFER_OBTAIN mode.
@@ -940,6 +942,8 @@ protected:
     // For Device Selection API
     //  a value of AUDIO_PORT_HANDLE_NONE indicated default (AudioPolicyManager) routing.
     audio_port_handle_t     mSelectedDeviceId;
+    bool                    mPlaybackRateSet;
+    bool                    mTrackOffloaded;
 
 private:
     class DeathNotifier : public IBinder::DeathRecipient {
@@ -957,6 +961,7 @@ private:
     pid_t                   mClientPid;
 
     sp<AudioSystem::AudioDeviceCallback> mDeviceCallback;
+    friend struct ExtendedMediaUtils;
 };
 
 class TimedAudioTrack : public AudioTrack

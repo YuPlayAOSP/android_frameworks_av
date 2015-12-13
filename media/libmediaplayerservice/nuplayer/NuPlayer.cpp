@@ -56,6 +56,7 @@
 
 #include "ESDS.h"
 #include <media/stagefright/Utils.h>
+#include "mediaplayerservice/AVNuExtensions.h"
 
 namespace android {
 
@@ -130,6 +131,23 @@ private:
     DISALLOW_EVIL_CONSTRUCTORS(FlushDecoderAction);
 };
 
+struct NuPlayer::InstantiateDecoderAction : public Action {
+    InstantiateDecoderAction(bool audio, sp<DecoderBase> *decoder)
+        : mAudio(audio),
+          mdecoder(decoder) {
+    }
+
+    virtual void execute(NuPlayer *player) {
+        player->instantiateDecoder(mAudio, mdecoder);
+    }
+
+private:
+    bool mAudio;
+    sp<DecoderBase> *mdecoder;
+
+    DISALLOW_EVIL_CONSTRUCTORS(InstantiateDecoderAction);
+};
+
 struct NuPlayer::PostMessageAction : public Action {
     PostMessageAction(const sp<AMessage> &msg)
         : mMessage(msg) {
@@ -188,6 +206,7 @@ NuPlayer::NuPlayer(pid_t pid)
       mPlaybackSettings(AUDIO_PLAYBACK_RATE_DEFAULT),
       mVideoFpsHint(-1.f),
       mStarted(false),
+      mResetting(false),
       mSourceStarted(false),
       mPaused(false),
       mPausedByClient(false),
@@ -216,7 +235,7 @@ void NuPlayer::setDataSourceAsync(const sp<IStreamSource> &source) {
     msg->post();
 }
 
-static bool IsHTTPLiveURL(const char *url) {
+bool NuPlayer::IsHTTPLiveURL(const char *url) {
     if (!strncasecmp("http://", url, 7)
             || !strncasecmp("https://", url, 8)
             || !strncasecmp("file://", url, 7)) {
@@ -1092,40 +1111,7 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                 int32_t reason;
                 CHECK(msg->findInt32("reason", &reason));
                 ALOGV("Tear down audio with reason %d.", reason);
-                mAudioDecoder.clear();
-                ++mAudioDecoderGeneration;
-                bool needsToCreateAudioDecoder = true;
-                if (mFlushingAudio == FLUSHING_DECODER) {
-                    mFlushComplete[1 /* audio */][1 /* isDecoder */] = true;
-                    mFlushingAudio = FLUSHED;
-                    finishFlushIfPossible();
-                } else if (mFlushingAudio == FLUSHING_DECODER_SHUTDOWN
-                        || mFlushingAudio == SHUTTING_DOWN_DECODER) {
-                    mFlushComplete[1 /* audio */][1 /* isDecoder */] = true;
-                    mFlushingAudio = SHUT_DOWN;
-                    finishFlushIfPossible();
-                    needsToCreateAudioDecoder = false;
-                }
-                if (mRenderer == NULL) {
-                    break;
-                }
-                closeAudioSink();
-                mRenderer->flush(
-                        true /* audio */, false /* notifyComplete */);
-                if (mVideoDecoder != NULL) {
-                    mRenderer->flush(
-                            false /* audio */, false /* notifyComplete */);
-                }
-
-                int64_t positionUs;
-                if (!msg->findInt64("positionUs", &positionUs)) {
-                    positionUs = mPreviousSeekTimeUs;
-                }
-                performSeek(positionUs);
-
-                if (reason == Renderer::kDueToError && needsToCreateAudioDecoder) {
-                    instantiateDecoder(true /* audio */, &mAudioDecoder);
-                }
+                performTearDown(msg);
             }
             break;
         }
@@ -1139,10 +1125,15 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
         {
             ALOGV("kWhatReset");
 
+            mResetting = true;
+
             mDeferredActions.push_back(
                     new FlushDecoderAction(
                         FLUSH_CMD_SHUTDOWN /* audio */,
                         FLUSH_CMD_SHUTDOWN /* video */));
+
+            mDeferredActions.push_back(
+                    new SimpleAction(&NuPlayer::closeAudioSink));
 
             mDeferredActions.push_back(
                     new SimpleAction(&NuPlayer::performReset));
@@ -1221,7 +1212,8 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
 }
 
 void NuPlayer::onResume() {
-    if (!mPaused) {
+    if (!mPaused || mResetting) {
+        ALOGD_IF(mResetting, "resetting, onResume discarded");
         return;
     }
     mPaused = false;
@@ -1295,6 +1287,7 @@ void NuPlayer::onStart(int64_t startPositionUs) {
     }
 
     sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
+    AVNuUtils::get()->setSourcePCMFormat(audioMeta);
     audio_stream_type_t streamType = AUDIO_STREAM_MUSIC;
     if (mAudioSink != NULL) {
         streamType = mAudioSink->getAudioStreamType();
@@ -1304,6 +1297,10 @@ void NuPlayer::onStart(int64_t startPositionUs) {
 
     mOffloadAudio =
         canOffloadStream(audioMeta, (videoFormat != NULL), mSource->isStreaming(), streamType);
+    if (!mOffloadAudio) {
+        mOffloadAudio = canOffloadDecodedPCMStream(audioMeta, (videoFormat != NULL), mSource->isStreaming(), streamType);
+    }
+
     if (mOffloadAudio) {
         flags |= Renderer::FLAG_OFFLOAD_AUDIO;
     }
@@ -1311,7 +1308,7 @@ void NuPlayer::onStart(int64_t startPositionUs) {
     sp<AMessage> notify = new AMessage(kWhatRendererNotify, this);
     ++mRendererGeneration;
     notify->setInt32("generation", mRendererGeneration);
-    mRenderer = new Renderer(mAudioSink, notify, flags);
+    mRenderer = AVNuFactory::get()->createRenderer(mAudioSink, notify, flags);
     mRendererLooper = new ALooper;
     mRendererLooper->setName("NuPlayerRenderer");
     mRendererLooper->start(false, false, ANDROID_PRIORITY_AUDIO);
@@ -1440,7 +1437,7 @@ void NuPlayer::tryOpenAudioSinkForOffload(const sp<AMessage> &format, bool hasVi
     // is possible; otherwise the decoders call the renderer openAudioSink directly.
 
     status_t err = mRenderer->openAudioSink(
-            format, true /* offloadOnly */, hasVideo, AUDIO_OUTPUT_FLAG_NONE, &mOffloadAudio);
+            format, true /* offloadOnly */, hasVideo, AUDIO_OUTPUT_FLAG_NONE, &mOffloadAudio, mSource->isStreaming());
     if (err != OK) {
         // Any failure we turn off mOffloadAudio.
         mOffloadAudio = false;
@@ -1470,8 +1467,11 @@ void NuPlayer::determineAudioModeChange() {
     sp<AMessage> videoFormat = mSource->getFormat(false /* audio */);
     audio_stream_type_t streamType = mAudioSink->getAudioStreamType();
     const bool hasVideo = (videoFormat != NULL);
-    const bool canOffload = canOffloadStream(
+    bool canOffload = canOffloadStream(
             audioMeta, hasVideo, mSource->isStreaming(), streamType);
+    if (!canOffload) {
+        canOffload = canOffloadDecodedPCMStream(audioMeta, (videoFormat != NULL), mSource->isStreaming(), streamType);
+    }
     if (canOffload) {
         if (!mOffloadAudio) {
             mRenderer->signalEnableOffloadAudio();
@@ -1483,6 +1483,7 @@ void NuPlayer::determineAudioModeChange() {
         if (mOffloadAudio) {
             mRenderer->signalDisableOffloadAudio();
             mOffloadAudio = false;
+            setDecodedPcmOffload(false);
         }
     }
 }
@@ -1493,7 +1494,10 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<DecoderBase> *decoder) {
     if (*decoder != NULL || (audio && mFlushingAudio == SHUT_DOWN)) {
         return OK;
     }
-
+    if (mSource == NULL) {
+        ALOGD("%s Ignore instantiate decoder after clearing source", __func__);
+        return INVALID_OPERATION;
+    }
     sp<AMessage> format = mSource->getFormat(audio);
 
     if (format == NULL) {
@@ -1531,12 +1535,17 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<DecoderBase> *decoder) {
         notify->setInt32("generation", mAudioDecoderGeneration);
 
         determineAudioModeChange();
-        if (mOffloadAudio) {
+
+        if (AVNuUtils::get()->isRAWFormat(format)) {
+            AVNuUtils::get()->setPCMFormat(format,
+                    AVNuUtils::get()->getKeyPCMFormat(mSource->getFormatMeta(true /* audio */)));
+        }
+        if (mOffloadAudio && !ifDecodedPCMOffload()) {
             const bool hasVideo = (mSource->getFormat(false /*audio */) != NULL);
             format->setInt32("has-video", hasVideo);
-            *decoder = new DecoderPassThrough(notify, mSource, mRenderer);
+            *decoder = AVNuFactory::get()->createPassThruDecoder(notify, mSource, mRenderer);
         } else {
-            *decoder = new Decoder(notify, mSource, mPID, mRenderer);
+            *decoder = AVNuFactory::get()->createDecoder(notify, mSource, mPID, mRenderer);
         }
     } else {
         sp<AMessage> notify = new AMessage(kWhatVideoNotify, this);
@@ -1561,7 +1570,8 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<DecoderBase> *decoder) {
     (*decoder)->configure(format);
 
     // allocate buffers to decrypt widevine source buffers
-    if (!audio && (mSourceFlags & Source::FLAG_SECURE)) {
+    if (!audio && ((mSourceFlags & Source::FLAG_SECURE) ||
+                   (mSourceFlags & Source::FLAG_USE_SET_BUFFERS))) {
         Vector<sp<ABuffer> > inputBufs;
         CHECK_EQ((*decoder)->getInputBuffers(&inputBufs), (status_t)OK);
 
@@ -1924,6 +1934,7 @@ void NuPlayer::performReset() {
     }
 
     mStarted = false;
+    mResetting = false;
     mSourceStarted = false;
 }
 
@@ -2184,7 +2195,7 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
             int posMs;
             int64_t timeUs, posUs;
             driver->getCurrentPosition(&posMs);
-            posUs = posMs * 1000;
+            posUs = (int64_t) posMs * 1000ll;
             CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
 
             if (posUs < timeUs) {
@@ -2214,6 +2225,13 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
         case Source::kWhatDrmNoLicense:
         {
             notifyListener(MEDIA_ERROR, MEDIA_ERROR_UNKNOWN, ERROR_DRM_NO_LICENSE);
+            break;
+        }
+
+        case Source::kWhatRTCPByeReceived:
+        {
+            ALOGV("notify the client that Bye message is received");
+            notifyListener(MEDIA_INFO, 2000, 0);
             break;
         }
 
@@ -2360,6 +2378,53 @@ void NuPlayer::Source::notifyInstantiateSecureDecoders(const sp<AMessage> &reply
 
 void NuPlayer::Source::onMessageReceived(const sp<AMessage> & /* msg */) {
     TRESPASS();
+}
+
+//
+// There is a flush from within the decoder's onFlush handling.
+// Without it, it is still possible that a buffer can be queueued
+// after NuPlayer issues a flush on the renderer's audio queue.
+//
+void NuPlayer::performTearDown(const sp<AMessage> &msg) {
+    int32_t reason;
+    CHECK(msg->findInt32("reason", &reason));
+
+    if (mAudioDecoder != NULL) {
+        switch (mFlushingAudio) {
+        case NONE:
+        case FLUSHING_DECODER:
+            mDeferredActions.push_back(
+                new FlushDecoderAction(FLUSH_CMD_SHUTDOWN /* audio */,
+                                       FLUSH_CMD_NONE /* video */));
+
+            if (reason == Renderer::kDueToError) {
+                mDeferredActions.push_back(
+                    new InstantiateDecoderAction(true /* audio */, &mAudioDecoder));
+            }
+
+            int64_t positionUs;
+            if (!msg->findInt64("positionUs", &positionUs)) {
+                positionUs = mPreviousSeekTimeUs;
+            }
+            mDeferredActions.push_back(new SeekAction(positionUs));
+            break;
+        default:
+            ALOGW("performTearDown while flushing audio in %d", mFlushingAudio);
+            break;
+        }
+    }
+
+    if (mRenderer != NULL) {
+        closeAudioSink();
+        // see comment at beginning of function
+        mRenderer->flush(
+            true /* audio */, false /* notifyComplete */);
+        if (mVideoDecoder != NULL) {
+            mRenderer->flush(
+                false /* audio */, false /* notifyComplete */);
+        }
+    }
+    processDeferredActions();
 }
 
 }  // namespace android

@@ -315,6 +315,12 @@ static const char *FourCC2MIME(uint32_t fourcc) {
         case FOURCC('m', 'p', '4', 'a'):
             return MEDIA_MIMETYPE_AUDIO_AAC;
 
+        case FOURCC('e', 'n', 'c', 'a'):
+            return MEDIA_MIMETYPE_AUDIO_AAC;
+
+        case FOURCC('.', 'm', 'p', '3'):
+            return MEDIA_MIMETYPE_AUDIO_MPEG;
+
         case FOURCC('s', 'a', 'm', 'r'):
             return MEDIA_MIMETYPE_AUDIO_AMR_NB;
 
@@ -322,6 +328,9 @@ static const char *FourCC2MIME(uint32_t fourcc) {
             return MEDIA_MIMETYPE_AUDIO_AMR_WB;
 
         case FOURCC('m', 'p', '4', 'v'):
+            return MEDIA_MIMETYPE_VIDEO_MPEG4;
+
+        case FOURCC('e', 'n', 'c', 'v'):
             return MEDIA_MIMETYPE_VIDEO_MPEG4;
 
         case FOURCC('s', '2', '6', '3'):
@@ -535,6 +544,7 @@ status_t MPEG4Extractor::readMetaData() {
     }
     if (psshsize > 0 && psshsize <= UINT32_MAX) {
         char *buf = (char*)malloc(psshsize);
+        CHECK(buf != NULL);
         char *ptr = buf;
         for (size_t i = 0; i < mPssh.size(); i++) {
             memcpy(ptr, mPssh[i].uuid, 20); // uuid + length
@@ -1351,7 +1361,14 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             mLastTrack->meta->setInt32(kKeySampleRate, sample_rate);
 
             off64_t stop_offset = *offset + chunk_size;
-            *offset = data_offset + sizeof(buffer);
+            if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_MPEG, FourCC2MIME(chunk_type)) ||
+                !strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_WB, FourCC2MIME(chunk_type))) {
+                // ESD is not required in mp3
+                // amr wb with damr atom corrupted can cause the clip to not play
+               *offset = stop_offset;
+            } else {
+               *offset = data_offset + sizeof(buffer);
+            }
             while (*offset < stop_offset) {
                 status_t err = parseChunk(offset, depth + 1);
                 if (err != OK) {
@@ -1590,13 +1607,21 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                 return ERROR_MALFORMED;
 
             *offset += chunk_size;
+            // Ignore stss block for audio even if its present
+            // All audio sample are sync samples itself,
+            // self decodeable and playable.
+            // Parsing this block for audio restricts audio seek to few entries
+            // available in this block, sometimes 0, which is undesired.
+            const char *mime;
+            CHECK(mLastTrack->meta->findCString(kKeyMIMEType, &mime));
+            if (strncasecmp("audio/", mime, 6)) {
+                status_t err =
+                    mLastTrack->sampleTable->setSyncSampleParams(
+                            data_offset, chunk_data_size);
 
-            status_t err =
-                mLastTrack->sampleTable->setSyncSampleParams(
-                        data_offset, chunk_data_size);
-
-            if (err != OK) {
-                return err;
+                if (err != OK) {
+                    return err;
+                }
             }
 
             break;
@@ -1693,6 +1718,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                     }
                 }
             }
+
+            updateVideoTrackInfoFromESDS_MPEG4Video(mLastTrack->meta);
+
             break;
         }
 
@@ -1776,13 +1804,13 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             if (!isParsingMetaKeys) {
                 uint8_t buffer[4];
                 if (chunk_data_size < (off64_t)sizeof(buffer)) {
-                    *offset += chunk_size;
+                    *offset = stop_offset;
                     return ERROR_MALFORMED;
                 }
 
                 if (mDataSource->readAt(
                             data_offset, buffer, 4) < 4) {
-                    *offset += chunk_size;
+                    *offset = stop_offset;
                     return ERROR_IO;
                 }
 
@@ -1793,7 +1821,7 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                     // apparently malformed chunks that don't have flags
                     // and completely different semantics than what's
                     // in the MPEG4 specs and skip it.
-                    *offset += chunk_size;
+                    *offset = stop_offset;
                     return OK;
                 }
                 *offset +=  sizeof(buffer);
@@ -2971,12 +2999,12 @@ status_t MPEG4Extractor::updateAudioTrackInfoFromESDS_MPEG4Audio(
         return OK;
     }
 
-    if (objectTypeIndication  == 0x6b) {
-        // The media subtype is MP3 audio
-        // Our software MP3 audio decoder may not be able to handle
-        // packetized MP3 audio; for now, lets just return ERROR_UNSUPPORTED
-        ALOGE("MP3 track in MP4/3GPP file is not supported");
-        return ERROR_UNSUPPORTED;
+    if (objectTypeIndication  == 0x6b
+         || objectTypeIndication  == 0x69) {
+         // This is mpeg1/2 audio content, set mimetype to mpeg
+         mLastTrack->meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG);
+         ALOGD("objectTypeIndication:0x%x, set mimetype to mpeg ",objectTypeIndication);
+         return OK;
     }
 
     const uint8_t *csd;
@@ -3129,7 +3157,7 @@ status_t MPEG4Extractor::updateAudioTrackInfoFromESDS_MPEG4Audio(
                         extensionFlag, objectType);
             }
 
-            if (numChannels == 0) {
+            if (numChannels == 0 && (br.numBitsLeft() > 0)) {
                 int32_t channelsEffectiveNum = 0;
                 int32_t channelsNum = 0;
                 if (br.numBitsLeft() < 32) {
@@ -4606,7 +4634,9 @@ static bool LegacySniffMPEG4(
         return false;
     }
 
-    if (!memcmp(header, "ftyp3gp", 7) || !memcmp(header, "ftypmp42", 8)
+    if (!memcmp(header, "ftyp3g2a", 8) || !memcmp(header, "ftyp3g2b", 8)
+        || !memcmp(header, "ftyp3g2c", 8)
+        || !memcmp(header, "ftyp3gp", 7) || !memcmp(header, "ftypmp42", 8)
         || !memcmp(header, "ftyp3gr6", 8) || !memcmp(header, "ftyp3gs6", 8)
         || !memcmp(header, "ftyp3ge6", 8) || !memcmp(header, "ftyp3gg6", 8)
         || !memcmp(header, "ftypisom", 8) || !memcmp(header, "ftypM4V ", 8)
